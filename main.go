@@ -81,3 +81,4 @@ func main() {
 	log.Println("🚀 Server running on port", port)
 	http.ListenAndServe(":"+port, nil)
 }
+log.Println("VERSION 2 - UPDATED SERVER")
