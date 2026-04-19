@@ -49,7 +49,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// 🔥 IMPORTANT: use client-provided ID
+		// ✅ Use client ID
 		id = p.ID
 		clients[conn] = id
 		players[id] = p
@@ -60,6 +60,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 func broadcast() {
 	data, _ := json.Marshal(players)
+
+	// 🔥 DEBUG: shows all players in logs
+	log.Println("PLAYERS:", players)
 
 	for conn := range clients {
 		err := conn.WriteMessage(websocket.TextMessage, data)
@@ -79,6 +82,9 @@ func main() {
 	http.HandleFunc("/ws", wsHandler)
 
 	log.Println("🚀 Server running on port", port)
-	http.ListenAndServe(":"+port, nil)
+
+	err := http.ListenAndServe(":"+port, nil)
+	if err != nil {
+		log.Fatal("Server error:", err)
+	}
 }
-log.Println("VERSION 2 - UPDATED SERVER")
