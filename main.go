@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"os" 
+	"os"
 
 	"github.com/gorilla/websocket"
 )
@@ -25,17 +25,18 @@ var upgrader = websocket.Upgrader{
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		log.Println("Upgrade error:", err)
 		return
 	}
 
-	id := conn.RemoteAddr().String()
-	clients[conn] = id
+	log.Println("New connection")
 
-	log.Println("Player connected:", id)
+	var id string
 
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
+			log.Println("Disconnected:", id)
 			delete(clients, conn)
 			delete(players, id)
 			conn.Close()
@@ -43,9 +44,14 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var p Player
-		json.Unmarshal(msg, &p)
+		err = json.Unmarshal(msg, &p)
+		if err != nil {
+			continue
+		}
 
-		p.ID = id
+		// 🔥 IMPORTANT: use client-provided ID
+		id = p.ID
+		clients[conn] = id
 		players[id] = p
 
 		broadcast()
@@ -56,7 +62,11 @@ func broadcast() {
 	data, _ := json.Marshal(players)
 
 	for conn := range clients {
-		conn.WriteMessage(websocket.TextMessage, data)
+		err := conn.WriteMessage(websocket.TextMessage, data)
+		if err != nil {
+			conn.Close()
+			delete(clients, conn)
+		}
 	}
 }
 
@@ -68,6 +78,6 @@ func main() {
 
 	http.HandleFunc("/ws", wsHandler)
 
-	log.Println("Server running on port", port)
+	log.Println("🚀 Server running on port", port)
 	http.ListenAndServe(":"+port, nil)
 }
