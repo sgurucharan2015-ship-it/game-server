@@ -33,7 +33,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 🔥 Assign ID ONCE (like Python server)
+	// 🔥 Assign ID (simple incremental)
 	mu.Lock()
 	id := strconv.Itoa(nextID)
 	nextID++
@@ -41,6 +41,16 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	log.Println("Player connected:", id)
+
+	// 🔥 SEND ID TO CLIENT (NEW)
+	err = conn.WriteJSON(map[string]string{
+		"your_id": id,
+	})
+	if err != nil {
+		log.Println("Error sending ID:", err)
+		conn.Close()
+		return
+	}
 
 	for {
 		_, msg, err := conn.ReadMessage()
@@ -63,20 +73,24 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		mu.Lock()
+
+		// update player state
 		players[id] = p
 
+		// 🔥 broadcast to ALL clients
 		data, _ := json.Marshal(players)
 
-		// 🔥 Send full state to THIS client (like Python server)
-		err = conn.WriteMessage(websocket.TextMessage, data)
-		mu.Unlock()
-
-		if err != nil {
-			break
+		for c := range clients {
+			err := c.WriteMessage(websocket.TextMessage, data)
+			if err != nil {
+				c.Close()
+				delete(clients, c)
+			}
 		}
+
+		mu.Unlock()
 	}
 }
-
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
