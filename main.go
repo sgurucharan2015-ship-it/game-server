@@ -14,6 +14,7 @@ import (
 type Player struct {
 	X float64 `json:"x"`
 	Z float64 `json:"z"`
+	Y float64 `json:"y"`
 }
 
 var players = make(map[string]Player)
