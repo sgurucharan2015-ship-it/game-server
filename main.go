@@ -49,15 +49,19 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// ✅ Use client ID
-		id = p.ID
-		clients[conn] = id
+		// 🔥 SET ID ONLY ONCE
+		if id == "" {
+			id = p.ID
+			clients[conn] = id
+		}
+
+		// 🔥 ALWAYS use same ID
+		p.ID = id
 		players[id] = p
 
 		broadcast()
 	}
 }
-
 func broadcast() {
 	data, _ := json.Marshal(players)
 
