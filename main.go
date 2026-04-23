@@ -12,9 +12,9 @@ import (
 )
 
 type Player struct {
-	X float64 `json:"x"`
-	Y float64 `json:"y"`
-	Z float64 `json:"z"`
+	X *float64 `json:"x"`
+	Y *float64 `json:"y"`
+	Z *float64 `json:"z"`
 }
 
 var players = make(map[string]Player)
@@ -43,7 +43,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Println("Player connected:", id)
 
-	// 🔥 SEND ID TO CLIENT (NEW)
+	// 🔥 SEND ID TO CLIENT
 	err = conn.WriteJSON(map[string]string{
 		"your_id": id,
 	})
@@ -75,8 +75,20 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		mu.Lock()
 
-		// update player state
-		players[id] = p
+		// 🔥 Preserve old values if Y (or others) not sent
+		old := players[id]
+
+		if p.X != nil {
+			old.X = p.X
+		}
+		if p.Y != nil {
+			old.Y = p.Y
+		}
+		if p.Z != nil {
+			old.Z = p.Z
+		}
+
+		players[id] = old
 
 		// 🔥 broadcast to ALL clients
 		data, _ := json.Marshal(players)
@@ -92,6 +104,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		mu.Unlock()
 	}
 }
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
