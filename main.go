@@ -25,6 +25,10 @@ type Pose struct {
 	X, Y, Z    float64
 	Yaw, Pitch float64
 	Health     float64
+	Hunger     float64
+	Selected   int
+	Held       int
+	Inventory  string
 }
 
 type Member struct {
@@ -44,16 +48,19 @@ type Event struct {
 }
 
 type Room struct {
-	Code      string
-	Limit     int
-	HostToken string
-	NextID    int
-	NextSeq   uint64
-	Created   time.Time
-	Config    map[string]string
-	Snapshot  string
-	Members   map[string]*Member // token -> member
-	Events    []Event
+	Code             string
+	Limit            int
+	HostToken        string
+	NextID           int
+	NextSeq          uint64
+	Created          time.Time
+	Config           map[string]string
+	Snapshot         string
+	SnapshotVersion  uint64
+	FullState        string
+	FullStateVersion uint64
+	Members          map[string]*Member // token -> member
+	Events           []Event
 }
 
 var state = struct {
@@ -404,7 +411,7 @@ func postEvent(w http.ResponseWriter, r *http.Request) {
 
 	typ := strings.ToUpper(strings.TrimSpace(v["type"]))
 	switch typ {
-	case "BLOCK", "CHAT", "SYSTEM":
+	case "BLOCK", "BREAK", "PLACE", "CHAT", "SYSTEM", "HIT", "PICKUP", "GRANT", "PROGRESS", "DAMAGE":
 	default:
 		writeErr(w, "BAD_EVENT", "Unsupported event type")
 		return
@@ -450,24 +457,51 @@ func tick(w http.ResponseWriter, r *http.Request) {
 
 	member.LastSeen = time.Now()
 	member.Pose = Pose{
-		X:      atof(v["x"], member.Pose.X),
-		Y:      atof(v["y"], member.Pose.Y),
-		Z:      atof(v["z"], member.Pose.Z),
-		Yaw:    atof(v["yaw"], member.Pose.Yaw),
-		Pitch:  atof(v["pitch"], member.Pose.Pitch),
-		Health: atof(v["health"], member.Pose.Health),
+		X:         atof(v["x"], member.Pose.X),
+		Y:         atof(v["y"], member.Pose.Y),
+		Z:         atof(v["z"], member.Pose.Z),
+		Yaw:       atof(v["yaw"], member.Pose.Yaw),
+		Pitch:     atof(v["pitch"], member.Pose.Pitch),
+		Health:    atof(v["health"], member.Pose.Health),
+		Hunger:    atof(v["hunger"], member.Pose.Hunger),
+		Selected:  clampInt(atoi(v["selected"], member.Pose.Selected), 0, 8),
+		Held:      clampInt(atoi(v["held"], member.Pose.Held), 0, 255),
+		Inventory: v["inventory"],
+	}
+
+	// The room host is the sole authority for dynamic world simulation.
+	// FullState contains day/night, mobs, projectiles, boss state and other
+	// shared runtime state.  It intentionally lives only in RAM.
+	if t == room.HostToken {
+		if fs := strings.TrimSpace(v["fullState"]); fs != "" {
+			if len(fs) <= maxBodyBytes/2 && fs != room.FullState {
+				room.FullState = fs
+				room.FullStateVersion++
+			}
+		}
 	}
 
 	since, _ := strconv.ParseUint(strings.TrimSpace(v["since"]), 10, 64)
+	stateVersion, _ := strconv.ParseUint(strings.TrimSpace(v["stateVersion"]), 10, 64)
+	snapshotVersion, _ := strconv.ParseUint(strings.TrimSpace(v["snapshotVersion"]), 10, 64)
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	fmt.Fprintf(w, "OK|%d|%d|%d\n", room.NextSeq-1, len(room.Members), room.Limit)
 
 	for _, m := range room.Members {
-		fmt.Fprintf(w, "P|%d|%s|%d|%.4f|%.4f|%.4f|%.5f|%.5f|%.2f\n",
+		fmt.Fprintf(w, "P|%d|%s|%d|%.4f|%.4f|%.4f|%.5f|%.5f|%.2f|%.2f|%d|%d|%s\n",
 			m.ID, m.Name, m.Skin,
 			m.Pose.X, m.Pose.Y, m.Pose.Z,
-			m.Pose.Yaw, m.Pose.Pitch, m.Pose.Health)
+			m.Pose.Yaw, m.Pose.Pitch, m.Pose.Health,
+			m.Pose.Hunger, m.Pose.Selected, m.Pose.Held, m.Pose.Inventory)
+	}
+
+	if room.FullState != "" && stateVersion < room.FullStateVersion {
+		fmt.Fprintf(w, "S|%d|%s\n", room.FullStateVersion, room.FullState)
+	}
+
+	if snapshotVersion < room.SnapshotVersion {
+		fmt.Fprintf(w, "W|%d|%s\n", room.SnapshotVersion, room.Snapshot)
 	}
 
 	for _, e := range room.Events {
@@ -499,8 +533,12 @@ func setSnapshot(w http.ResponseWriter, r *http.Request) {
 	if m := room.Members[t]; m != nil {
 		m.LastSeen = time.Now()
 	}
-	room.Snapshot = v["snapshot"]
-	fmt.Fprintln(w, "ok=1")
+	nextSnapshot := v["snapshot"]
+	if nextSnapshot != room.Snapshot {
+		room.Snapshot = nextSnapshot
+		room.SnapshotVersion++
+	}
+	fmt.Fprintf(w, "ok=1\nversion=%d\n", room.SnapshotVersion)
 }
 
 func getSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -526,6 +564,7 @@ func getSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	fmt.Fprintln(w, "ok=1")
+	fmt.Fprintf(w, "version=%d\n", room.SnapshotVersion)
 	fmt.Fprintf(w, "snapshot=%s\n", room.Snapshot)
 }
 
