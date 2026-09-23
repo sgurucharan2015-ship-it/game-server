@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,7 +50,11 @@ type Event struct {
 
 type Room struct {
 	Code             string
-	Limit            int
+	Limit            int // 0 means unlimited
+	LimitEnabled     bool
+	Public           bool
+	ServerName       string
+	Description      string
 	HostToken        string
 	NextID           int
 	NextSeq          uint64
@@ -72,6 +77,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", root)
 	mux.HandleFunc("/health", health)
+	mux.HandleFunc("/public/list", publicList)
 	mux.HandleFunc("/create", createRoom)
 	mux.HandleFunc("/join", joinRoom)
 	mux.HandleFunc("/leave", leaveRoom)
@@ -167,6 +173,30 @@ func sanitizeName(s string) string {
 	return b.String()
 }
 
+func sanitizeListingText(s string, maxLen int, fallback string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "|", "/")
+
+	var b strings.Builder
+	for _, r := range s {
+		if r < 32 {
+			continue
+		}
+		b.WriteRune(r)
+		if b.Len() >= maxLen {
+			break
+		}
+	}
+
+	result := strings.TrimSpace(b.String())
+	if result == "" {
+		return fallback
+	}
+	return result
+}
+
 func cleanEventData(s string) string {
 	s = strings.ReplaceAll(s, "\r", " ")
 	s = strings.ReplaceAll(s, "\n", " ")
@@ -185,6 +215,13 @@ func clampInt(v, lo, hi int) int {
 		return hi
 	}
 	return v
+}
+
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func atoi(s string, fallback int) int {
@@ -235,7 +272,70 @@ var configKeys = []string{
 	"worldName", "seed", "gameMode", "difficulty", "worldType", "singleBiome",
 	"allowCommands", "generateStructures", "bonusChest", "keepInventory",
 	"doMobSpawning", "doWaterFlow", "doDaylightCycle", "experiments",
+	"pvpEnabled",
 	"voidGateBuilt", "voidUnlocked", "voidArenaBuilt", "gameWon", "advancementMask",
+}
+
+func publicList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type publicRoom struct {
+		Code        string
+		Name        string
+		Description string
+		Players     int
+		Limit       int
+		PVP         bool
+		Created     time.Time
+	}
+
+	state.Lock()
+	rooms := make([]publicRoom, 0, len(state.Rooms))
+	for _, room := range state.Rooms {
+		if !room.Public {
+			continue
+		}
+		rooms = append(rooms, publicRoom{
+			Code:        room.Code,
+			Name:        room.ServerName,
+			Description: room.Description,
+			Players:     len(room.Members),
+			Limit:       room.Limit,
+			PVP:         room.Config["pvpEnabled"] == "1",
+			Created:     room.Created,
+		})
+	}
+	state.Unlock()
+
+	// Keep the browser stable instead of exposing Go map iteration order.
+	sort.Slice(rooms, func(i, j int) bool {
+		if strings.EqualFold(rooms[i].Name, rooms[j].Name) {
+			return rooms[i].Created.Before(rooms[j].Created)
+		}
+		return strings.ToLower(rooms[i].Name) < strings.ToLower(rooms[j].Name)
+	})
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintf(w, "OK|%d\n", len(rooms))
+	for _, room := range rooms {
+		pvp := 0
+		if room.PVP {
+			pvp = 1
+		}
+		fmt.Fprintf(
+			w,
+			"R|%s|%s|%s|%d|%d|%d\n",
+			room.Code,
+			room.Name,
+			room.Description,
+			room.Players,
+			room.Limit,
+			pvp,
+		)
+	}
 }
 
 func createRoom(w http.ResponseWriter, r *http.Request) {
@@ -246,7 +346,14 @@ func createRoom(w http.ResponseWriter, r *http.Request) {
 
 	name := sanitizeName(v["name"])
 	skin := clampInt(atoi(v["skin"], 0), 0, 7)
-	limit := clampInt(atoi(v["limit"], 4), 2, 8)
+	serverName := sanitizeListingText(v["serverName"], 48, name+"'s Server")
+	description := sanitizeListingText(v["description"], 180, "No description.")
+	isPublic := strings.TrimSpace(v["public"]) == "1"
+	limitEnabled := strings.TrimSpace(v["limitEnabled"]) != "0"
+	limit := 0
+	if limitEnabled {
+		limit = clampInt(atoi(v["limit"], 4), 2, 32)
+	}
 
 	state.Lock()
 	defer state.Unlock()
@@ -273,19 +380,25 @@ func createRoom(w http.ResponseWriter, r *http.Request) {
 	}
 
 	room := &Room{
-		Code:      code,
-		Limit:     limit,
-		HostToken: hostToken,
-		NextID:    2,
-		NextSeq:   1,
-		Created:   time.Now(),
-		Config:    cfg,
-		Members:   map[string]*Member{hostToken: host},
+		Code:         code,
+		Limit:        limit,
+		LimitEnabled: limitEnabled,
+		Public:       isPublic,
+		ServerName:   serverName,
+		Description:  description,
+		HostToken:    hostToken,
+		NextID:       2,
+		NextSeq:      1,
+		Created:      time.Now(),
+		Config:       cfg,
+		Members:      map[string]*Member{hostToken: host},
 	}
 	state.Rooms[code] = room
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	fmt.Fprintf(w, "ok=1\nroom=%s\ntoken=%s\nplayerId=1\nlimit=%d\n", code, hostToken, limit)
+	fmt.Fprintf(w, "serverName=%s\ndescription=%s\npublic=%d\nlimitEnabled=%d\n",
+		room.ServerName, room.Description, boolInt(room.Public), boolInt(room.LimitEnabled))
 }
 
 func joinRoom(w http.ResponseWriter, r *http.Request) {
@@ -306,7 +419,7 @@ func joinRoom(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, "ROOM_NOT_FOUND", "That temporary room does not exist")
 		return
 	}
-	if len(room.Members) >= room.Limit {
+	if room.LimitEnabled && room.Limit > 0 && len(room.Members) >= room.Limit {
 		writeErr(w, "SERVER_FULL", "That temporary room is full")
 		return
 	}
@@ -322,6 +435,8 @@ func joinRoom(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	fmt.Fprintf(w, "ok=1\nroom=%s\ntoken=%s\nplayerId=%d\nlimit=%d\n", code, t, id, room.Limit)
+	fmt.Fprintf(w, "serverName=%s\ndescription=%s\npublic=%d\nlimitEnabled=%d\n",
+		room.ServerName, room.Description, boolInt(room.Public), boolInt(room.LimitEnabled))
 	for _, k := range configKeys {
 		fmt.Fprintf(w, "%s=%s\n", k, room.Config[k])
 	}
@@ -410,6 +525,61 @@ func postEvent(w http.ResponseWriter, r *http.Request) {
 	member.LastSeen = time.Now()
 
 	typ := strings.ToUpper(strings.TrimSpace(v["type"]))
+
+	// PvP is chosen by the room host. Validate it on the public relay too,
+	// so a modified client cannot bypass a combat-disabled room or hit from
+	// across the map.
+	if typ == "PVP" {
+		if room.Config["pvpEnabled"] != "1" {
+			writeErr(w, "PVP_DISABLED", "Player combat is disabled in this room")
+			return
+		}
+
+		parts := strings.Split(cleanEventData(v["data"]), ",")
+		if len(parts) < 2 {
+			writeErr(w, "BAD_PVP", "Malformed player combat event")
+			return
+		}
+
+		targetID := atoi(strings.TrimSpace(parts[0]), -1)
+		damage, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+		if err != nil || targetID <= 0 || targetID == member.ID {
+			writeErr(w, "BAD_PVP", "Invalid combat target or damage")
+			return
+		}
+
+		var target *Member
+		for _, candidate := range room.Members {
+			if candidate.ID == targetID {
+				target = candidate
+				break
+			}
+		}
+		if target == nil {
+			writeErr(w, "BAD_PVP", "Target player is no longer in the room")
+			return
+		}
+
+		dx := member.Pose.X - target.Pose.X
+		dy := member.Pose.Y - target.Pose.Y
+		dz := member.Pose.Z - target.Pose.Z
+		if dx*dx+dy*dy+dz*dz > 64.0 {
+			writeErr(w, "PVP_TOO_FAR", "Target is out of combat range")
+			return
+		}
+
+		if damage < 0.0 {
+			damage = 0.0
+		}
+		if damage > 10.0 {
+			damage = 10.0
+		}
+
+		appendEventLocked(room, member.ID, "PVP", fmt.Sprintf("%d,%.2f", targetID, damage))
+		fmt.Fprintln(w, "ok=1")
+		return
+	}
+
 	switch typ {
 	case "BLOCK", "BREAK", "PLACE", "CHAT", "SYSTEM", "HIT", "PICKUP", "GRANT", "PROGRESS", "DAMAGE":
 	default:
