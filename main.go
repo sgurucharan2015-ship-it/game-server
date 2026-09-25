@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -86,6 +91,7 @@ func main() {
 	mux.HandleFunc("/tick", tick)
 	mux.HandleFunc("/snapshot/set", setSnapshot)
 	mux.HandleFunc("/snapshot/get", getSnapshot)
+	mux.HandleFunc("/ws", websocketRelay)
 
 	go reaper()
 
@@ -736,6 +742,439 @@ func getSnapshot(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok=1")
 	fmt.Fprintf(w, "version=%d\n", room.SnapshotVersion)
 	fmt.Fprintf(w, "snapshot=%s\n", room.Snapshot)
+}
+
+const webSocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+func websocketAccept(key string) string {
+	sum := sha1.Sum([]byte(strings.TrimSpace(key) + webSocketGUID))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func websocketRelay(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") ||
+		!strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") ||
+		strings.TrimSpace(r.Header.Get("Sec-WebSocket-Version")) != "13" {
+		http.Error(w, "WebSocket upgrade required", http.StatusBadRequest)
+		return
+	}
+
+	key := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
+	if key == "" {
+		http.Error(w, "Missing Sec-WebSocket-Key", http.StatusBadRequest)
+		return
+	}
+
+	code := strings.TrimSpace(r.URL.Query().Get("room"))
+	t := strings.TrimSpace(r.Header.Get("X-Voxel-Token"))
+	if t == "" {
+		// Query fallback makes testing with generic WebSocket clients easier,
+		// but the official client sends the token in a header so it is not
+		// normally exposed in the URL.
+		t = strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+
+	state.Lock()
+	room := state.Rooms[code]
+	member := memberForLocked(room, t)
+	if room == nil || member == nil {
+		state.Unlock()
+		http.Error(w, "Unknown room or player token", http.StatusUnauthorized)
+		return
+	}
+	member.LastSeen = time.Now()
+	state.Unlock()
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "WebSocket unsupported by HTTP server", http.StatusInternalServerError)
+		return
+	}
+
+	conn, rw, err := hijacker.Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	_, _ = fmt.Fprintf(
+		rw,
+		"HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: %s\r\n"+
+			"\r\n",
+		websocketAccept(key),
+	)
+	if err := rw.Flush(); err != nil {
+		return
+	}
+
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+		message, err := readWebSocketText(rw)
+		if err != nil {
+			return
+		}
+
+		verb, values := parseWebSocketCommand(message)
+
+		switch verb {
+		case "TICK":
+			values["room"] = code
+			values["token"] = t
+
+			response := websocketTick(values)
+
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := writeWebSocketText(rw.Writer, response); err != nil {
+				return
+			}
+
+		case "PING":
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := writeWebSocketText(rw.Writer, "PONG"); err != nil {
+				return
+			}
+
+		default:
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := writeWebSocketText(rw.Writer, "ERR|BAD_MESSAGE|Unsupported WebSocket message"); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func parseWebSocketCommand(message string) (string, map[string]string) {
+	message = strings.ReplaceAll(message, "\r", "")
+	lines := strings.Split(message, "\n")
+	if len(lines) == 0 {
+		return "", map[string]string{}
+	}
+
+	verb := strings.ToUpper(strings.TrimSpace(lines[0]))
+	values := make(map[string]string)
+
+	for _, line := range lines[1:] {
+		if line == "" {
+			continue
+		}
+		if i := strings.IndexByte(line, '='); i >= 0 {
+			values[strings.TrimSpace(line[:i])] = line[i+1:]
+		}
+	}
+
+	return verb, values
+}
+
+func websocketTick(v map[string]string) string {
+	state.Lock()
+	defer state.Unlock()
+
+	code := strings.TrimSpace(v["room"])
+	room := state.Rooms[code]
+	if room == nil {
+		return "ERR|ROOM_GONE|Host stopped or disconnected\n"
+	}
+
+	t := strings.TrimSpace(v["token"])
+	member := memberForLocked(room, t)
+	if member == nil {
+		return "ERR|BAD_TOKEN|Session is no longer valid\n"
+	}
+
+	member.LastSeen = time.Now()
+	member.Pose = Pose{
+		X:         atof(v["x"], member.Pose.X),
+		Y:         atof(v["y"], member.Pose.Y),
+		Z:         atof(v["z"], member.Pose.Z),
+		Yaw:       atof(v["yaw"], member.Pose.Yaw),
+		Pitch:     atof(v["pitch"], member.Pose.Pitch),
+		Health:    atof(v["health"], member.Pose.Health),
+		Hunger:    atof(v["hunger"], member.Pose.Hunger),
+		Selected:  clampInt(atoi(v["selected"], member.Pose.Selected), 0, 8),
+		Held:      clampInt(atoi(v["held"], member.Pose.Held), 0, 255),
+		Inventory: v["inventory"],
+	}
+
+	// Host-authored dynamic state rides on the same persistent WebSocket tick.
+	if t == room.HostToken {
+		if fs := strings.TrimSpace(v["fullState"]); fs != "" {
+			if len(fs) <= maxBodyBytes/2 && fs != room.FullState {
+				room.FullState = fs
+				room.FullStateVersion++
+			}
+		}
+
+		if v["snapshotPresent"] == "1" {
+			nextSnapshot := v["snapshot"]
+			if len(nextSnapshot) <= maxBodyBytes && nextSnapshot != room.Snapshot {
+				room.Snapshot = nextSnapshot
+				room.SnapshotVersion++
+			}
+		}
+	}
+
+	// One gameplay event may be piggy-backed on a tick. This removes another
+	// HTTP request and preserves the existing ordered room event stream.
+	if typ := strings.ToUpper(strings.TrimSpace(v["eventType"])); typ != "" {
+		applyWebSocketEventLocked(room, member, typ, v["eventData"])
+	}
+
+	since, _ := strconv.ParseUint(strings.TrimSpace(v["since"]), 10, 64)
+	stateVersion, _ := strconv.ParseUint(strings.TrimSpace(v["stateVersion"]), 10, 64)
+	snapshotVersion, _ := strconv.ParseUint(strings.TrimSpace(v["snapshotVersion"]), 10, 64)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "OK|%d|%d|%d\n", room.NextSeq-1, len(room.Members), room.Limit)
+
+	for _, m := range room.Members {
+		fmt.Fprintf(&b, "P|%d|%s|%d|%.4f|%.4f|%.4f|%.5f|%.5f|%.2f|%.2f|%d|%d|%s\n",
+			m.ID, m.Name, m.Skin,
+			m.Pose.X, m.Pose.Y, m.Pose.Z,
+			m.Pose.Yaw, m.Pose.Pitch, m.Pose.Health,
+			m.Pose.Hunger, m.Pose.Selected, m.Pose.Held, m.Pose.Inventory)
+	}
+
+	if room.FullState != "" && stateVersion < room.FullStateVersion {
+		fmt.Fprintf(&b, "S|%d|%s\n", room.FullStateVersion, room.FullState)
+	}
+
+	if snapshotVersion < room.SnapshotVersion {
+		fmt.Fprintf(&b, "W|%d|%s\n", room.SnapshotVersion, room.Snapshot)
+	}
+
+	for _, e := range room.Events {
+		if e.Seq > since {
+			fmt.Fprintf(&b, "E|%d|%d|%s|%s\n", e.Seq, e.SenderID, e.Type, e.Data)
+		}
+	}
+
+	return b.String()
+}
+
+func applyWebSocketEventLocked(room *Room, member *Member, typ, data string) {
+	if room == nil || member == nil {
+		return
+	}
+
+	member.LastSeen = time.Now()
+	typ = strings.ToUpper(strings.TrimSpace(typ))
+	data = cleanEventData(data)
+
+	if typ == "PVP" {
+		if room.Config["pvpEnabled"] != "1" {
+			return
+		}
+
+		parts := strings.Split(data, ",")
+		if len(parts) < 2 {
+			return
+		}
+
+		targetID := atoi(strings.TrimSpace(parts[0]), -1)
+		damage, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+		if err != nil || targetID <= 0 || targetID == member.ID {
+			return
+		}
+
+		var target *Member
+		for _, candidate := range room.Members {
+			if candidate.ID == targetID {
+				target = candidate
+				break
+			}
+		}
+		if target == nil {
+			return
+		}
+
+		dx := member.Pose.X - target.Pose.X
+		dy := member.Pose.Y - target.Pose.Y
+		dz := member.Pose.Z - target.Pose.Z
+		if dx*dx+dy*dy+dz*dz > 64.0 {
+			return
+		}
+
+		if damage < 0.0 {
+			damage = 0.0
+		}
+		if damage > 10.0 {
+			damage = 10.0
+		}
+
+		appendEventLocked(room, member.ID, "PVP", fmt.Sprintf("%d,%.2f", targetID, damage))
+		return
+	}
+
+	switch typ {
+	case "BLOCK", "BREAK", "PLACE", "CHAT", "SYSTEM", "HIT", "PICKUP", "GRANT", "PROGRESS", "DAMAGE":
+		appendEventLocked(room, member.ID, typ, data)
+	}
+}
+
+// Dependency-free RFC6455 framing. Official VoxelCraft clients send masked
+// text frames through WinHTTP; Render terminates TLS before forwarding the
+// upgraded TCP connection to this Go process.
+func readWebSocketText(rw *bufio.ReadWriter) (string, error) {
+	var message []byte
+	var started bool
+
+	for {
+		fin, opcode, payload, err := readWebSocketFrame(rw.Reader)
+		if err != nil {
+			return "", err
+		}
+
+		switch opcode {
+		case 0x8: // close
+			_ = writeWebSocketFrame(rw.Writer, true, 0x8, nil)
+			return "", io.EOF
+
+		case 0x9: // ping
+			if err := writeWebSocketFrame(rw.Writer, true, 0xA, payload); err != nil {
+				return "", err
+			}
+			continue
+
+		case 0xA: // pong
+			continue
+
+		case 0x1: // text
+			if started {
+				return "", errors.New("unexpected new text frame")
+			}
+			started = true
+			message = append(message, payload...)
+
+		case 0x0: // continuation
+			if !started {
+				return "", errors.New("unexpected continuation frame")
+			}
+			message = append(message, payload...)
+
+		default:
+			return "", errors.New("unsupported websocket opcode")
+		}
+
+		if len(message) > maxBodyBytes*2 {
+			return "", errors.New("websocket message too large")
+		}
+
+		if started && fin {
+			return string(message), nil
+		}
+	}
+}
+
+func readWebSocketFrame(r *bufio.Reader) (bool, byte, []byte, error) {
+	var header [2]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return false, 0, nil, err
+	}
+
+	fin := (header[0] & 0x80) != 0
+	opcode := header[0] & 0x0F
+	masked := (header[1] & 0x80) != 0
+	length := uint64(header[1] & 0x7F)
+
+	switch length {
+	case 126:
+		var ext [2]byte
+		if _, err := io.ReadFull(r, ext[:]); err != nil {
+			return false, 0, nil, err
+		}
+		length = uint64(binary.BigEndian.Uint16(ext[:]))
+
+	case 127:
+		var ext [8]byte
+		if _, err := io.ReadFull(r, ext[:]); err != nil {
+			return false, 0, nil, err
+		}
+		length = binary.BigEndian.Uint64(ext[:])
+	}
+
+	if length > uint64(maxBodyBytes*2) {
+		return false, 0, nil, errors.New("websocket frame too large")
+	}
+
+	// RFC6455 requires all client-to-server frames to be masked.
+	if !masked {
+		return false, 0, nil, errors.New("unmasked client websocket frame")
+	}
+
+	var mask [4]byte
+	if _, err := io.ReadFull(r, mask[:]); err != nil {
+		return false, 0, nil, err
+	}
+
+	payload := make([]byte, int(length))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return false, 0, nil, err
+	}
+
+	for i := range payload {
+		payload[i] ^= mask[i&3]
+	}
+
+	return fin, opcode, payload, nil
+}
+
+func writeWebSocketText(w *bufio.Writer, text string) error {
+	return writeWebSocketFrame(w, true, 0x1, []byte(text))
+}
+
+func writeWebSocketFrame(w *bufio.Writer, fin bool, opcode byte, payload []byte) error {
+	first := opcode & 0x0F
+	if fin {
+		first |= 0x80
+	}
+
+	if err := w.WriteByte(first); err != nil {
+		return err
+	}
+
+	n := len(payload)
+	switch {
+	case n < 126:
+		if err := w.WriteByte(byte(n)); err != nil {
+			return err
+		}
+
+	case n <= 0xFFFF:
+		if err := w.WriteByte(126); err != nil {
+			return err
+		}
+		var ext [2]byte
+		binary.BigEndian.PutUint16(ext[:], uint16(n))
+		if _, err := w.Write(ext[:]); err != nil {
+			return err
+		}
+
+	default:
+		if err := w.WriteByte(127); err != nil {
+			return err
+		}
+		var ext [8]byte
+		binary.BigEndian.PutUint64(ext[:], uint64(n))
+		if _, err := w.Write(ext[:]); err != nil {
+			return err
+		}
+	}
+
+	if len(payload) > 0 {
+		if _, err := w.Write(payload); err != nil {
+			return err
+		}
+	}
+
+	return w.Flush()
 }
 
 func writeErr(w http.ResponseWriter, code, message string) {
