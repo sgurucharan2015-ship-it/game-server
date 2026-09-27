@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -83,6 +85,7 @@ func main() {
 	mux.HandleFunc("/", root)
 	mux.HandleFunc("/health", health)
 	mux.HandleFunc("/public/list", publicList)
+	mux.HandleFunc("/admin/rooms", adminRooms)
 	mux.HandleFunc("/create", createRoom)
 	mux.HandleFunc("/join", joinRoom)
 	mux.HandleFunc("/leave", leaveRoom)
@@ -280,6 +283,135 @@ var configKeys = []string{
 	"doMobSpawning", "doWaterFlow", "doDaylightCycle", "experiments",
 	"pvpEnabled",
 	"voidGateBuilt", "voidUnlocked", "voidArenaBuilt", "gameWon", "advancementMask",
+}
+
+type adminMemberView struct {
+	ID              int     `json:"id"`
+	Name            string  `json:"name"`
+	Skin            int     `json:"skin"`
+	LastSeenSeconds float64 `json:"lastSeenSeconds"`
+	Health          float64 `json:"health"`
+	Hunger          float64 `json:"hunger"`
+}
+
+type adminRoomView struct {
+	Code          string            `json:"code"`
+	Name          string            `json:"name"`
+	Description   string            `json:"description"`
+	Public        bool              `json:"public"`
+	Players       int               `json:"players"`
+	Limit         int               `json:"limit"`
+	LimitEnabled  bool              `json:"limitEnabled"`
+	PVP           bool              `json:"pvp"`
+	Created       time.Time         `json:"created"`
+	UptimeSeconds int64             `json:"uptimeSeconds"`
+	WorldName     string            `json:"worldName"`
+	GameMode      string            `json:"gameMode"`
+	Difficulty    string            `json:"difficulty"`
+	Members       []adminMemberView `json:"members"`
+}
+
+type adminRoomsResponse struct {
+	ServerTime   time.Time       `json:"serverTime"`
+	RoomCount    int             `json:"roomCount"`
+	TotalPlayers int             `json:"totalPlayers"`
+	Rooms        []adminRoomView `json:"rooms"`
+}
+
+func validAdminKey(r *http.Request) bool {
+	want := strings.TrimSpace(os.Getenv("VOXELCRAFT_ADMIN_KEY"))
+	if want == "" {
+		return false
+	}
+
+	got := strings.TrimSpace(r.Header.Get("X-Voxel-Admin-Key"))
+	if len(got) != len(want) {
+		return false
+	}
+
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func adminRooms(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if strings.TrimSpace(os.Getenv("VOXELCRAFT_ADMIN_KEY")) == "" {
+		http.Error(w, "Admin monitoring is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	if !validAdminKey(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	now := time.Now()
+	response := adminRoomsResponse{
+		ServerTime: now,
+		Rooms:      make([]adminRoomView, 0),
+	}
+
+	state.Lock()
+	response.Rooms = make([]adminRoomView, 0, len(state.Rooms))
+	for _, room := range state.Rooms {
+		members := make([]adminMemberView, 0, len(room.Members))
+		for _, member := range room.Members {
+			age := now.Sub(member.LastSeen).Seconds()
+			if age < 0 {
+				age = 0
+			}
+			members = append(members, adminMemberView{
+				ID:              member.ID,
+				Name:            member.Name,
+				Skin:            member.Skin,
+				LastSeenSeconds: age,
+				Health:          member.Pose.Health,
+				Hunger:          member.Pose.Hunger,
+			})
+		}
+
+		sort.Slice(members, func(i, j int) bool {
+			return members[i].ID < members[j].ID
+		})
+
+		response.TotalPlayers += len(members)
+		response.Rooms = append(response.Rooms, adminRoomView{
+			Code:          room.Code,
+			Name:          room.ServerName,
+			Description:   room.Description,
+			Public:        room.Public,
+			Players:       len(members),
+			Limit:         room.Limit,
+			LimitEnabled:  room.LimitEnabled,
+			PVP:           room.Config["pvpEnabled"] == "1",
+			Created:       room.Created,
+			UptimeSeconds: int64(now.Sub(room.Created).Seconds()),
+			WorldName:     room.Config["worldName"],
+			GameMode:      room.Config["gameMode"],
+			Difficulty:    room.Config["difficulty"],
+			Members:       members,
+		})
+	}
+	state.Unlock()
+
+	response.RoomCount = len(response.Rooms)
+
+	sort.Slice(response.Rooms, func(i, j int) bool {
+		if response.Rooms[i].Created.Equal(response.Rooms[j].Created) {
+			return response.Rooms[i].Code < response.Rooms[j].Code
+		}
+		return response.Rooms[i].Created.Before(response.Rooms[j].Created)
+	})
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(true)
+	if err := enc.Encode(response); err != nil {
+		log.Printf("admin rooms encode error: %v", err)
+	}
 }
 
 func publicList(w http.ResponseWriter, r *http.Request) {
